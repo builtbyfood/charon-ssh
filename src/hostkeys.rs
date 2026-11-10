@@ -5,6 +5,13 @@
 //! that is present in either is trusted; a *different* key for the same host in
 //! either is a hard failure — never silently accepted.
 //!
+//! ⚠ "Different" includes a different key *type*. russh's own check only
+//! calls a mismatch a change when the algorithms agree, and reports a host
+//! with an ed25519 key on file, offered an RSA one, as merely unknown. With a
+//! trust-on-first-use policy that is a silent bypass: whoever sits in the
+//! path offers only RSA, the new key is learned, and the password follows.
+//! So a host with any entry on file is never `Unknown` here.
+//!
 //! Trust on first use lives here: `check` reports `Unknown` and it is the
 //! caller's job to ask someone, then call `learn`. This module never prompts,
 //! which is what lets it be shared between applications with different UIs.
@@ -58,10 +65,23 @@ impl HostKeys {
     pub fn check(&self, host: &str, port: u16, key: &PublicKey) -> Verdict {
         let sources = std::iter::once(&self.own).chain(self.user.iter());
         let mut known = false;
+        // The first entry on file for this host, of whatever type, if the key
+        // turns out to match none of them.
+        let mut other: Option<(PathBuf, usize)> = None;
         for file in sources {
             match russh::keys::check_known_hosts_path(host, port, key, file) {
                 Ok(true) => known = true,
-                Ok(false) => {}
+                Ok(false) => {
+                    if other.is_none() {
+                        if let Ok(entries) =
+                            russh::keys::known_hosts::known_host_keys_path(host, port, file)
+                        {
+                            if let Some((line, _)) = entries.first() {
+                                other = Some((file.clone(), real_line(file, *line)));
+                            }
+                        }
+                    }
+                }
                 Err(russh::keys::Error::KeyChanged { line }) => {
                     return Verdict::Changed { file: file.clone(), line: real_line(file, line) };
                 }
@@ -70,7 +90,13 @@ impl HostKeys {
                 Err(e) => tracing::warn!(file = %file.display(), "known_hosts unreadable: {e}"),
             }
         }
-        if known { Verdict::Known } else { Verdict::Unknown }
+        match (known, other) {
+            (true, _) => Verdict::Known,
+            // A key of another type is on file and this one is not: a change,
+            // not a first meeting. See the module docs.
+            (false, Some((file, line))) => Verdict::Changed { file, line },
+            (false, None) => Verdict::Unknown,
+        }
     }
 
     /// Is this the application's own (writable) file, as opposed to the user's?
@@ -208,6 +234,46 @@ mod tests {
             }
             v => panic!("expected Changed, got {v:?}"),
         }
+    }
+
+    /// An ECDSA key, for the different-type case.
+    fn ecdsa_key() -> PublicKey {
+        let pem = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBAgFLNP+hrAVOB2ebGyk1nwH+rGv25yVv+PuZt3wNgu8wK2OkrA2t5H5hx2dzXmHMmVqcfVqlUVv3DjYlbh8oaU=";
+        PublicKey::from_openssh(pem).unwrap()
+    }
+
+    #[test]
+    fn a_key_of_another_type_is_a_change_not_a_first_meeting() {
+        let dir = tempfile::tempdir().unwrap();
+        let hk = HostKeys::with_paths(dir.path().join("known_hosts"), None);
+        hk.learn("h", 22, &key()).unwrap();
+        match hk.check("h", 22, &ecdsa_key()) {
+            Verdict::Changed { file, line } => {
+                let text = std::fs::read_to_string(file).unwrap();
+                assert!(text.lines().nth(line - 1).unwrap().starts_with("h ssh-ed25519 "));
+            }
+            v => panic!("an ed25519 host offering ECDSA must not be Unknown, got {v:?}"),
+        }
+        // Both types on file, either one offered: known.
+        let both = key();
+        let hk2 = HostKeys::with_paths(dir.path().join("kh2"), None);
+        hk2.learn("h", 22, &both).unwrap();
+        hk2.learn("h", 22, &ecdsa_key()).unwrap();
+        assert_eq!(hk2.check("h", 22, &both), Verdict::Known);
+        assert_eq!(hk2.check("h", 22, &ecdsa_key()), Verdict::Known);
+        // Another host's entry says nothing about this one.
+        assert_eq!(hk.check("other", 22, &ecdsa_key()), Verdict::Unknown);
+    }
+
+    #[test]
+    fn known_in_one_file_wins_over_another_type_in_the_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user_known_hosts");
+        let hk = HostKeys::with_paths(dir.path().join("known_hosts"), Some(user.clone()));
+        let k = key();
+        russh::keys::known_hosts::learn_known_hosts_path("h", 22, &ecdsa_key(), &user).unwrap();
+        hk.learn("h", 22, &k).unwrap();
+        assert_eq!(hk.check("h", 22, &k), Verdict::Known);
     }
 
     #[test]
