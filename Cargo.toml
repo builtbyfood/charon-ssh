@@ -3,13 +3,15 @@ name = "charon-ssh"
 version = "0.2.1"
 edition = "2021"
 license = "Apache-2.0"
+repository = "https://github.com/builtbyfood/charon-ssh"
+readme = "README.md"
 description = "SSH transport, PTY sessions and host-key TOFU, extracted from charon so other applications can share one implementation"
 
 # Deliberately free of tauri, rusqlite, serialport and portable-pty. Everything
 # this crate knows how to do is expressed over plain channels and traits, so the
 # application on top decides how output reaches a UI and how a user is asked
-# about an unknown host key. charon emits Tauri events; hvm-desk does something
-# else; neither difference belongs in here.
+# about an unknown host key. charon emits Tauri events; morpheus-certificate-install
+# does something else; neither difference belongs in here.
 
 [dependencies]
 anyhow = "1"
